@@ -39,7 +39,7 @@ public class ReservaServiceImpl implements ReservaService {
                 entity.clienteId(),
                 entity.status() == null ? ReservaStatus.PENDING : entity.status(),
                 entity.valorTotal(),
-                moeda,
+                "BRL",
                 entity.correlationId(),
                 now,
                 now

@@ -1,5 +1,5 @@
 server:
-  port: 8080
+  port: 8082
 
 spring:
   application:
@@ -17,7 +17,9 @@ springdoc:
 
 logging:
   level:
-    org.springframework.r2dbc: INFO
+    org.springframework.r2dbc: DEBUG
+    org.springframework.data.r2dbc: DEBUG
+    io.r2dbc.postgresql.QUERY: DEBUG
+    io.r2dbc.postgresql.PARAM: DEBUG
     org.springdoc: DEBUG
     org.springframework.web.reactive.resource: DEBUG
-

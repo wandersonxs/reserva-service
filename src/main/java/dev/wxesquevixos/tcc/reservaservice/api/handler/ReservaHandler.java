@@ -112,11 +112,17 @@ public class ReservaHandler {
                     .bodyValue(new ErrorResponse("BAD_REQUEST", "Formato de parâmetro inválido."));
         }
 
-        // 4. CONFLITO
-        if (ex instanceof IllegalStateException) {
+        // 4. CONFLITO (constraint / duplicidade / integridade)
+        if (ex instanceof org.springframework.dao.DataIntegrityViolationException
+                || ex instanceof io.r2dbc.spi.R2dbcDataIntegrityViolationException
+                || ex instanceof org.springframework.dao.DuplicateKeyException) {
+
             return status(409)
                     .contentType(MediaType.APPLICATION_JSON)
-                    .bodyValue(new ErrorResponse("CONFLICT", ex.getMessage()));
+                    .bodyValue(new ErrorResponse(
+                            "CONFLICT",
+                            "Reserva já existe para o correlationId informado"
+                    ));
         }
 
         // 5. ERRO GENÉRICO
