@@ -1,0 +1,23 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: reserva-service
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/reserva_db
+    username: app
+    password: app
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    org.springframework.r2dbc: INFO
+    org.springdoc: DEBUG
+    org.springframework.web.reactive.resource: DEBUG
+
