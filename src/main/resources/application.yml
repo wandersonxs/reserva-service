@@ -8,6 +8,37 @@ spring:
     url: r2dbc:postgresql://localhost:5432/reserva_db
     username: app
     password: app
+  kafka:
+    bootstrap-servers: localhost:29092
+
+    consumer:
+      group-id: reserva-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+    properties:
+      spring.json.use.type.headers: false
+      spring.json.trusted.packages: "*"
+      spring.json.value.default.type: java.lang.Object
+
+    listener:
+      ack-mode: manual
+
+app:
+  kafka:
+    source: reserva-service
+    consumer:
+      group-id: reserva-service
+    topics:
+      reserva-events: reserva.events
+      aereo-events: aereo.events
+      pagamento-events: pagamento.events
 
 springdoc:
   api-docs:

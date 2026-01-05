@@ -2,8 +2,10 @@ package dev.wxesquevixos.tcc.reservaservice.service.impl;
 
 import dev.wxesquevixos.tcc.reservaservice.domain.ReservaEntity;
 import dev.wxesquevixos.tcc.reservaservice.domain.ReservaStatus;
+import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaAereaSolicitarRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaCreateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaUpdateRequest;
+import dev.wxesquevixos.tcc.reservaservice.kafka.producer.ReservaProducer;
 import dev.wxesquevixos.tcc.reservaservice.mapper.ReservaMapper;
 import dev.wxesquevixos.tcc.reservaservice.repository.ReservaRepository;
 import dev.wxesquevixos.tcc.reservaservice.service.ReservaService;
@@ -20,10 +22,13 @@ public class ReservaServiceImpl implements ReservaService {
 
     private final ReservaRepository repository;
     private final WebClient webClient;
+    private final ReservaProducer producer;
 
-    public ReservaServiceImpl(ReservaRepository repository, WebClient webClient) {
+
+    public ReservaServiceImpl(ReservaRepository repository, WebClient webClient, ReservaProducer producer) {
         this.repository = repository;
         this.webClient = webClient;
+        this.producer = producer;
     }
 
     @Override
@@ -106,5 +111,41 @@ public class ReservaServiceImpl implements ReservaService {
         //         .bodyToMono(Void.class);
 
         return Mono.empty();
+    }
+
+    public Mono<ReservaEntity> solicitarCompraAerea(ReservaAereaSolicitarRequest req) {
+
+        var correlationId = req.correlationId() != null ? req.correlationId() : UUID.randomUUID();
+        var moeda = (req.moeda() == null || req.moeda().isBlank()) ? "BRL" : req.moeda();
+
+        var toSave = new ReservaEntity(
+                null,
+                req.clienteId(),
+                ReservaStatus.PENDING,
+                req.valor(),
+                moeda,
+                correlationId,
+                OffsetDateTime.now(),
+                OffsetDateTime.now()
+        );
+
+        return validateClienteExternally(toSave.clienteId())
+                .then(repository.existsByCorrelationId(correlationId))
+                .flatMap(exists -> exists
+                        ? repository.findByCorrelationId(correlationId)
+                        : repository.save(toSave)
+                )
+                .doOnNext(saved -> producer.publicarReservaCriada(
+                        new dev.wxesquevixos.tcc.reservaservice.kafka.dto.ReservaCriadaData(
+                                saved.id(),
+                                req.vooId(),
+                                saved.valorTotal(),
+                                saved.moeda(),
+                                req.metodo(),
+                                req.destinatario(),
+                                correlationId
+                        ),
+                        correlationId
+                ));
     }
 }

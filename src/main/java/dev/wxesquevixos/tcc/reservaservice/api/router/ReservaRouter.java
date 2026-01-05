@@ -1,6 +1,7 @@
 package dev.wxesquevixos.tcc.reservaservice.api.router;
 
 import dev.wxesquevixos.tcc.reservaservice.api.handler.ReservaHandler;
+import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaAereaSolicitarRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaCreateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaUpdateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.response.ReservaResponse;
@@ -29,6 +30,31 @@ public class ReservaRouter {
 
     @Bean
     @RouterOperations({
+
+            // ✅ NOVO: endpoint que inicia o fluxo (BFF -> reserva-service)
+            @RouterOperation(
+                    path = "/api/v1/reservas/aereas/solicitar",
+                    method = RequestMethod.POST,
+                    beanClass = ReservaHandler.class,
+                    beanMethod = "solicitarCompraAerea",
+                    operation = @Operation(
+                            summary = "Solicitar compra aérea (inicia SAGA e publica RESERVA_CRIADA)",
+                            operationId = "solicitarCompraAerea",
+                            tags = {"Reserva"},
+                            requestBody = @RequestBody(
+                                    required = true,
+                                    content = @Content(schema = @Schema(implementation = ReservaAereaSolicitarRequest.class))
+                            ),
+                            responses = {
+                                    @ApiResponse(responseCode = "202", description = "Solicitação aceita e fluxo iniciado",
+                                            content = @Content(schema = @Schema(implementation = ReservaResponse.class))),
+                                    @ApiResponse(responseCode = "400", description = "Dados inválidos"),
+                                    @ApiResponse(responseCode = "409", description = "Conflito (correlationId duplicado)")
+                            }
+                    )
+            ),
+
+            // -------- CRUD atual ----------
             @RouterOperation(
                     path = "/api/v1/reservas",
                     method = RequestMethod.POST,
@@ -145,6 +171,8 @@ public class ReservaRouter {
                         .PUT("/{id}", accept(MediaType.APPLICATION_JSON), handler::update)
                         .DELETE("/{id}", handler::delete)
                 )
+                // ✅ NOVO: rota fora do path base /reservas (pra ficar sem conflito e mais semântico)
+                .POST("/api/v1/reservas/aereas/solicitar", accept(MediaType.APPLICATION_JSON), handler::solicitarCompraAerea)
                 .build();
     }
 }

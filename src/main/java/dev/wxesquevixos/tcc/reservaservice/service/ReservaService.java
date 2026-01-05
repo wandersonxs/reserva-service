@@ -1,6 +1,7 @@
 package dev.wxesquevixos.tcc.reservaservice.service;
 
 import dev.wxesquevixos.tcc.reservaservice.domain.ReservaEntity;
+import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaAereaSolicitarRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaCreateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaUpdateRequest;
 import reactor.core.publisher.Flux;
@@ -21,4 +22,7 @@ public interface ReservaService {
     Mono<ReservaEntity> update(Long id, ReservaUpdateRequest req);
 
     Mono<Void> delete(Long id);
+
+    Mono<ReservaEntity> solicitarCompraAerea(ReservaAereaSolicitarRequest req);
+
 }
