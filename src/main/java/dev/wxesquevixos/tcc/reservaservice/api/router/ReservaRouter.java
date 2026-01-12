@@ -31,7 +31,7 @@ public class ReservaRouter {
     @Bean
     @RouterOperations({
 
-            // ✅ NOVO: endpoint que inicia o fluxo (BFF -> reserva-service)
+            // ✅ NOVO: endpoint que inicia o fluxo (Coreografia)
             @RouterOperation(
                     path = "/api/v1/reservas/aereas/solicitar",
                     method = RequestMethod.POST,

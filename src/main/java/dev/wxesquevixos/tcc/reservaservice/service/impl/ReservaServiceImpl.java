@@ -5,6 +5,11 @@ import dev.wxesquevixos.tcc.reservaservice.domain.ReservaStatus;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaAereaSolicitarRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaCreateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaUpdateRequest;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ClienteSnapshot;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ClienteValidadoData;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.EventEnvelope;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ReservaCriadaData;
+import dev.wxesquevixos.tcc.reservaservice.kafka.producer.ClienteValidationProducer;
 import dev.wxesquevixos.tcc.reservaservice.kafka.producer.ReservaProducer;
 import dev.wxesquevixos.tcc.reservaservice.mapper.ReservaMapper;
 import dev.wxesquevixos.tcc.reservaservice.repository.ReservaRepository;
@@ -23,31 +28,44 @@ public class ReservaServiceImpl implements ReservaService {
     private final ReservaRepository repository;
     private final WebClient webClient;
     private final ReservaProducer producer;
+    private final ClienteValidationProducer clienteValidationProducer;
 
-
-    public ReservaServiceImpl(ReservaRepository repository, WebClient webClient, ReservaProducer producer) {
+    public ReservaServiceImpl(
+            ReservaRepository repository,
+            WebClient webClient,
+            ReservaProducer producer,
+            ClienteValidationProducer clienteValidationProducer
+    ) {
         this.repository = repository;
         this.webClient = webClient;
         this.producer = producer;
+        this.clienteValidationProducer = clienteValidationProducer;
     }
 
     @Override
     public Mono<ReservaEntity> create(ReservaCreateRequest req) {
         var entity = ReservaMapper.toEntity(req);
 
-        // defaults de aplicação (evita null e garante consistência)
         var now = OffsetDateTime.now();
-        var moeda = entity.moeda() == null || entity.moeda().isBlank() ? "BRL" : entity.moeda();
+        var moeda = (entity.moeda() == null || entity.moeda().isBlank()) ? "BRL" : entity.moeda();
+        var status = (entity.status() == null) ? ReservaStatus.PENDING : entity.status();
 
+        // ✅ Agora sem destinatario e com snapshot (pode ser null no CRUD)
         var toSave = new ReservaEntity(
                 null,
                 entity.clienteId(),
-                entity.status() == null ? ReservaStatus.PENDING : entity.status(),
+                entity.vooId(),
+                status,
                 entity.valorTotal(),
-                "BRL",
+                moeda,
+                entity.metodo(),
+                entity.motivoCancelamento(),
                 entity.correlationId(),
                 now,
-                now
+                now,
+                entity.clientePaymentToken(),
+                entity.clienteEmail(),
+                entity.clienteNome()
         );
 
         return validateClienteExternally(toSave.clienteId())
@@ -79,17 +97,26 @@ public class ReservaServiceImpl implements ReservaService {
     public Mono<ReservaEntity> update(Long id, ReservaUpdateRequest req) {
         return findById(id)
                 .flatMap(existing -> {
-                    // Regras mínimas: só atualiza campos permitidos e sempre atualiza "atualizadoEm"
+
                     var updated = new ReservaEntity(
                             existing.id(),
                             req.clienteId() != null ? req.clienteId() : existing.clienteId(),
+                            existing.vooId(), // não atualiza aqui
                             req.status() != null ? req.status() : existing.status(),
                             req.valorTotal() != null ? req.valorTotal() : existing.valorTotal(),
                             (req.moeda() != null && !req.moeda().isBlank()) ? req.moeda() : existing.moeda(),
+                            existing.metodo(), // não atualiza aqui
+                            req.motivoCancelamento() != null ? req.motivoCancelamento() : existing.motivoCancelamento(),
                             existing.correlationId(),
                             existing.criadoEm(),
-                            OffsetDateTime.now()
+                            OffsetDateTime.now(),
+
+                            // snapshot fica como está (CRUD não “reinventa” snapshot)
+                            existing.clientePaymentToken(),
+                            existing.clienteEmail(),
+                            existing.clienteNome()
                     );
+
                     return repository.save(updated);
                 });
     }
@@ -100,52 +127,143 @@ public class ReservaServiceImpl implements ReservaService {
     }
 
     /**
-     * Exemplo: valida se o cliente existe chamando o cliente-service.
-     * Se você não tiver endpoint ainda, pode deixar Mono.empty().
+     * Mantido como estava (hoje retorna empty).
+     * Se quiser, pode remover WebClient depois.
      */
     private Mono<Void> validateClienteExternally(Long clienteId) {
-        // Exemplo (troque pela URL/rota real):
-        // return webClient.get()
-        //         .uri("http://cliente-service/clientes/{id}", clienteId)
-        //         .retrieve()
-        //         .bodyToMono(Void.class);
-
         return Mono.empty();
     }
 
+    /**
+     * Fluxo SAGA:
+     * 1) cria reserva PENDING_VALIDATION
+     * 2) publica VALIDAR_CLIENTE
+     * 3) publica RESERVA_PENDENTE_VALIDACAO (para notificação)
+     *
+     * Obs: aqui ainda podemos usar req.destinatario() apenas para a notificação
+     * “em validação”, mas NÃO persistimos esse campo na reserva.
+     */
     public Mono<ReservaEntity> solicitarCompraAerea(ReservaAereaSolicitarRequest req) {
 
         var correlationId = req.correlationId() != null ? req.correlationId() : UUID.randomUUID();
         var moeda = (req.moeda() == null || req.moeda().isBlank()) ? "BRL" : req.moeda();
+        var now = OffsetDateTime.now();
 
         var toSave = new ReservaEntity(
                 null,
                 req.clienteId(),
-                ReservaStatus.PENDING,
+                req.vooId(),
+                ReservaStatus.PENDING_VALIDATION,
                 req.valor(),
                 moeda,
+                req.metodo(),
+                null, // motivoCancelamento
                 correlationId,
-                OffsetDateTime.now(),
-                OffsetDateTime.now()
+                now,
+                now,
+
+                // snapshot ainda não existe aqui
+                null,
+                null,
+                null
         );
 
-        return validateClienteExternally(toSave.clienteId())
-                .then(repository.existsByCorrelationId(correlationId))
+        return repository.existsByCorrelationId(correlationId)
                 .flatMap(exists -> exists
-                        ? repository.findByCorrelationId(correlationId)
+                        ? repository.findByCorrelationId(correlationId) // idempotência
                         : repository.save(toSave)
                 )
-                .doOnNext(saved -> producer.publicarReservaCriada(
-                        new dev.wxesquevixos.tcc.reservaservice.kafka.dto.ReservaCriadaData(
-                                saved.id(),
-                                req.vooId(),
-                                saved.valorTotal(),
-                                saved.moeda(),
-                                req.metodo(),
-                                req.destinatario(),
-                                correlationId
-                        ),
-                        correlationId
-                ));
+                .doOnNext(saved -> {
+                    // 1) validação do cliente
+                    clienteValidationProducer.publicarValidarCliente(saved.id(), saved.clienteId(), correlationId);
+
+                    // 2) notificação "em validação" (usa destinatario do request)
+//                    producer.publicarReservaPendenteValidacao(
+//                            saved.id(),
+//                            correlationId,
+//                            saved.clienteEmail()
+//                    );
+                });
+    }
+
+    @Override
+    public Mono<Void> onClienteValidado(EventEnvelope env, ClienteValidadoData data) {
+
+        final UUID correlationId = env.correlationId();
+        final ClienteSnapshot snapshot = data.snapshot(); // pode vir null
+
+        return repository.findById(data.reservaId())
+                .switchIfEmpty(Mono.error(new IllegalStateException("Reserva não encontrada: " + data.reservaId())))
+                .flatMap(existing -> {
+
+                    // snapshot “normalizado” para persistir (sem NPE)
+                    final String paymentToken = snapshot != null ? snapshot.paymentToken() : null;
+                    final String email = snapshot != null ? snapshot.email() : null;
+                    final String nome = snapshot != null ? snapshot.nome() : null;
+
+                    if (!data.valido()) {
+
+                        var cancelled = new ReservaEntity(
+                                existing.id(),
+                                existing.clienteId(),
+                                existing.vooId(),
+                                ReservaStatus.CANCELLED,
+                                existing.valorTotal(),
+                                existing.moeda(),
+                                existing.metodo(),
+                                data.motivo() != null ? data.motivo() : "CLIENTE_INVALIDO",
+                                existing.correlationId(),
+                                existing.criadoEm(),
+                                OffsetDateTime.now(),
+                                paymentToken,
+                                email,
+                                nome
+                        );
+
+                        return repository.save(cancelled)
+                                .doOnSuccess(saved ->
+                                        producer.publicarReservaCancelada(
+                                                saved.id(),
+                                                correlationId,
+                                                saved.motivoCancelamento(),
+                                                snapshot
+                                        )
+                                )
+                                .then();
+                    }
+
+                    // ✅ cliente válido -> reserva pronta para seguir (PENDING) e snapshot persistido
+                    var pending = new ReservaEntity(
+                            existing.id(),
+                            existing.clienteId(),
+                            existing.vooId(),
+                            ReservaStatus.PENDING,
+                            existing.valorTotal(),
+                            existing.moeda(),
+                            existing.metodo(),
+                            null,
+                            existing.correlationId(),
+                            existing.criadoEm(),
+                            OffsetDateTime.now(),
+                            paymentToken,
+                            email,
+                            nome
+                    );
+
+                    return repository.save(pending)
+                            .doOnSuccess(saved -> producer.publicarReservaCriada(
+                                    new ReservaCriadaData(
+                                            saved.id(),
+                                            saved.vooId(),
+                                            saved.valorTotal(),
+                                            saved.moeda(),
+                                            saved.metodo(),
+                                            snapshot,
+                                            correlationId
+                                    ),
+                                    correlationId
+                            ))
+                            .then();
+                });
     }
 }

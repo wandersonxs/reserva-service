@@ -3,8 +3,8 @@ package dev.wxesquevixos.tcc.reservaservice.kafka.consumer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.wxesquevixos.tcc.reservaservice.domain.ReservaEntity;
 import dev.wxesquevixos.tcc.reservaservice.domain.ReservaStatus;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ClienteSnapshot;
 import dev.wxesquevixos.tcc.reservaservice.kafka.dto.EventEnvelope;
-import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ReservaEventTypes;
 import dev.wxesquevixos.tcc.reservaservice.kafka.producer.ReservaProducer;
 import dev.wxesquevixos.tcc.reservaservice.repository.ReservaRepository;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -50,69 +50,91 @@ public class PagamentoReservaConsumer {
 
             Mono<Void> pipeline = switch (env.type()) {
 
-                // ✅ Pagamento aprovado -> confirma reserva + publica RESERVA_CONFIRMADA
+                // ✅ Pagamento aprovado -> confirma reserva + publica RESERVA_CONFIRMADA (com snapshot)
                 case "PAGAMENTO_AUTORIZADO", "PAGAMENTO_CAPTURADO" ->
                         repository.findByCorrelationId(correlationId)
+                                .switchIfEmpty(Mono.error(new IllegalStateException(
+                                        "Reserva não encontrada para correlationId=" + correlationId)))
                                 .flatMap(reserva -> {
+
                                     final ReservaEntity updated = new ReservaEntity(
                                             reserva.id(),
                                             reserva.clienteId(),
+                                            reserva.vooId(),
                                             ReservaStatus.CONFIRMED,
                                             reserva.valorTotal(),
                                             reserva.moeda(),
+                                            reserva.metodo(),
+                                            reserva.motivoCancelamento(), // continua null normalmente
                                             reserva.correlationId(),
                                             reserva.criadoEm(),
-                                            OffsetDateTime.now()
+                                            OffsetDateTime.now(),
+                                            reserva.clientePaymentToken(),
+                                            reserva.clienteEmail(),
+                                            reserva.clienteNome()
                                     );
 
-//                                    var env = new EventEnvelope(
-//                                            UUID.randomUUID(),
-//                                            ReservaEventTypes.RESERVA_CONFIRMADA,
-//                                            correlationId,
-//                                            OffsetDateTime.now(),
-//                                            source,
-//                                            Map.of("reservaId", reservaId, "correlationId", correlationId)
-
+                                    final ClienteSnapshot snapshot = new ClienteSnapshot(
+                                            updated.clientePaymentToken(),
+                                            updated.clienteEmail(),
+                                            updated.clienteNome()
+                                    );
                                     return repository.save(updated)
-                                            .doOnNext(saved -> producer.publicarReservaConfirmada(
-                                                    saved.id(),
-//                                                    saved.vooId(),          // se não existir no entity, veja OBS abaixo
-//                                                    saved.moeda(),
-//                                                    saved.valorTotal(),
-//                                                    /*destinatario*/ null, // se não existir no entity, veja OBS abaixo
-                                                    saved.correlationId()
-                                            ))
+                                            .doOnNext(saved ->
+                                                    producer.publicarReservaConfirmada(
+                                                            saved.id(),
+                                                            saved.vooId(),
+                                                            saved.valorTotal(),
+                                                            saved.moeda(),
+                                                            saved.metodo(),
+                                                            saved.correlationId(),
+                                                            snapshot
+                                                    )
+                                            )
                                             .then();
                                 });
 
-                // ❌ Pagamento recusado/falhou -> cancela reserva + publica RESERVA_CANCELADA
+                // ❌ Pagamento recusado/falhou -> cancela reserva + publica RESERVA_CANCELADA (com snapshot)
                 case "PAGAMENTO_RECUSADO", "PAGAMENTO_FALHOU" ->
                         repository.findByCorrelationId(correlationId)
+                                .switchIfEmpty(Mono.error(new IllegalStateException(
+                                        "Reserva não encontrada para correlationId=" + correlationId)))
                                 .flatMap(reserva -> {
+
+                                    final String motivo = extractMotivo(env);
+
                                     final ReservaEntity updated = new ReservaEntity(
                                             reserva.id(),
                                             reserva.clienteId(),
+                                            reserva.vooId(),
                                             ReservaStatus.CANCELLED,
                                             reserva.valorTotal(),
                                             reserva.moeda(),
+                                            reserva.metodo(),
+                                            motivo,
                                             reserva.correlationId(),
                                             reserva.criadoEm(),
-                                            OffsetDateTime.now()
+                                            OffsetDateTime.now(),
+                                            reserva.clientePaymentToken(),
+                                            reserva.clienteEmail(),
+                                            reserva.clienteNome()
                                     );
 
-                                    // motivo (se vier no data); como seu EventEnvelope tem Map, dá pra pegar assim:
-                                    final String motivo = extractMotivo(env);
+                                    final ClienteSnapshot snapshot = new ClienteSnapshot(
+                                            updated.clientePaymentToken(),
+                                            updated.clienteEmail(),
+                                            updated.clienteNome()
+                                    );
 
                                     return repository.save(updated)
-                                            .doOnNext(saved -> producer.publicarReservaCancelada(
-                                                    saved.id(),
-//                                                    saved.vooId(),          // se não existir no entity, veja OBS abaixo
-//                                                    saved.moeda(),
-//                                                    saved.valorTotal(),
-//                                                    /*destinatario*/ null, // se não existir no entity, veja OBS abaixo
-                                                    saved.correlationId(),
-                                                    motivo
-                                            ))
+                                            .doOnNext(saved ->
+                                                    producer.publicarReservaCancelada(
+                                                            saved.id(),
+                                                            saved.correlationId(),
+                                                            motivo,
+                                                            snapshot
+                                                    )
+                                            )
                                             .then();
                                 });
 
@@ -139,7 +161,7 @@ public class PagamentoReservaConsumer {
 
     private static String extractMotivo(EventEnvelope env) {
         try {
-            if (env.data() instanceof java.util.Map<?, ?> map) {
+            if (env.data() instanceof Map<?, ?> map) {
                 Object v = map.get("motivo");
                 return v != null ? v.toString() : "Pagamento recusado/falhou";
             }

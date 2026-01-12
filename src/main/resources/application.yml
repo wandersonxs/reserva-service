@@ -39,6 +39,7 @@ app:
       reserva-events: reserva.events
       aereo-events: aereo.events
       pagamento-events: pagamento.events
+      cliente-validation: cliente.validation
 
 springdoc:
   api-docs:

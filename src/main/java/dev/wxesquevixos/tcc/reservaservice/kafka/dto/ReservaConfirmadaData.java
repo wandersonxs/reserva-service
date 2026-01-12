@@ -1,14 +1,12 @@
 package dev.wxesquevixos.tcc.reservaservice.kafka.dto;
 
 import java.math.BigDecimal;
-import java.util.UUID;
 
-public record ReservaCriadaData(
+public record ReservaConfirmadaData(
         Long reservaId,
         Long vooId,
         BigDecimal valor,
         String moeda,
         String metodo,
-        ClienteSnapshot snapshot,
-        UUID correlationId
+        ClienteSnapshot snapshot
 ) {}

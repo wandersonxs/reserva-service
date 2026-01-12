@@ -4,6 +4,8 @@ import dev.wxesquevixos.tcc.reservaservice.domain.ReservaEntity;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaAereaSolicitarRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaCreateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaUpdateRequest;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ClienteValidadoData;
+import dev.wxesquevixos.tcc.reservaservice.kafka.dto.EventEnvelope;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -24,5 +26,8 @@ public interface ReservaService {
     Mono<Void> delete(Long id);
 
     Mono<ReservaEntity> solicitarCompraAerea(ReservaAereaSolicitarRequest req);
+
+    Mono<Void> onClienteValidado(EventEnvelope env, ClienteValidadoData data);
+
 
 }

@@ -9,6 +9,5 @@ public record ReservaAereaSolicitarRequest(
         BigDecimal valor,
         String moeda,
         String metodo,
-        String destinatario,
         UUID correlationId
 ) {}
