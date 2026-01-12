@@ -4,12 +4,21 @@ server:
 spring:
   application:
     name: reserva-service
+
   r2dbc:
     url: r2dbc:postgresql://localhost:5432/reserva_db
     username: app
     password: app
+
   kafka:
     bootstrap-servers: localhost:29092
+
+    listener:
+      ack-mode: manual
+      observation-enabled: true
+
+    template:
+      observation-enabled: true
 
     consumer:
       group-id: reserva-service
@@ -26,9 +35,6 @@ spring:
       spring.json.use.type.headers: false
       spring.json.trusted.packages: "*"
       spring.json.value.default.type: java.lang.Object
-
-    listener:
-      ack-mode: manual
 
 app:
   kafka:
@@ -47,11 +53,69 @@ springdoc:
   swagger-ui:
     path: /swagger-ui.html
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+  # tags padrão para TODAS observações (HTTP, Kafka, etc.)
+  observations:
+    key-values:
+      application: reserva-service #${spring.application.name}
+
+  # garante o service.name no Resource do OpenTelemetry (muito útil no Jaeger)
+  opentelemetry:
+    resource-attributes:
+      service.name: reserva-service #${spring.application.name}
+    tracing:
+      export:
+        otlp:
+          endpoint: http://localhost:4318/v1/traces
+
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: true
+
+  # traces via OTLP -> OpenTelemetry Collector (porta exposta no host)
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        # ajuste estes nomes para os meters reais que você criou
+        # saga.transaction.duration: true
+        # saga.step.duration: true
+
+    export:
+      otlp:
+        enabled: true
+        endpoint: http://localhost:4318/v1/metrics
+        step: 10s
+
+experiment:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/saga_experiment
+    username: app
+    password: app
+    schema: observability
+
 logging:
+  pattern:
+    level: "%5p [traceId=%X{traceId:-} spanId=%X{spanId:-} correlationId=%X{correlationId:-}]"
   level:
+    # quando estiver depurando porque não aparece no Jaeger:
+    io.opentelemetry: DEBUG
+    io.micrometer.tracing: DEBUG
+    org.springframework.boot.actuate.autoconfigure.tracing: DEBUG
+
     org.springframework.r2dbc: DEBUG
     org.springframework.data.r2dbc: DEBUG
     io.r2dbc.postgresql.QUERY: DEBUG
     io.r2dbc.postgresql.PARAM: DEBUG
-    org.springdoc: DEBUG
-    org.springframework.web.reactive.resource: DEBUG

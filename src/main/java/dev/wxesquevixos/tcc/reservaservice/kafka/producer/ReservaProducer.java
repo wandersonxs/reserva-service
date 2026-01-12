@@ -4,10 +4,22 @@ import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ClienteSnapshot;
 import dev.wxesquevixos.tcc.reservaservice.kafka.dto.EventEnvelope;
 import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ReservaCriadaData;
 import dev.wxesquevixos.tcc.reservaservice.kafka.dto.ReservaEventTypes;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.propagation.TextMapPropagator;
+import io.opentelemetry.context.propagation.TextMapSetter;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.Headers;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.util.HashMap;
 import java.util.Map;
@@ -16,18 +28,49 @@ import java.util.UUID;
 @Component
 public class ReservaProducer {
 
+    private static final TextMapPropagator PROPAGATOR =
+            GlobalOpenTelemetry.getPropagators().getTextMapPropagator();
+
+    private static final TextMapSetter<Headers> KAFKA_HEADERS_SETTER = (headers, key, value) -> {
+        if (headers == null || key == null || value == null) return;
+        headers.remove(key);
+        headers.add(key, value.getBytes(StandardCharsets.UTF_8));
+    };
+
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final ObservationRegistry observationRegistry;
+    private final MeterRegistry meterRegistry;
     private final String reservaEventsTopic;
     private final String source;
 
+    // ✅ Contadores para “fim” da saga (publicação bem-sucedida)
+    private final Counter sagaEndConfirmed;
+    private final Counter sagaEndCancelled;
+
     public ReservaProducer(
             KafkaTemplate<String, Object> kafkaTemplate,
+            ObservationRegistry observationRegistry,
+            MeterRegistry meterRegistry,
             @Value("${app.kafka.topics.reserva-events}") String reservaEventsTopic,
             @Value("${app.kafka.source}") String source
     ) {
         this.kafkaTemplate = kafkaTemplate;
+        this.observationRegistry = observationRegistry;
+        this.meterRegistry = meterRegistry;
         this.reservaEventsTopic = reservaEventsTopic;
         this.source = source;
+
+        this.sagaEndConfirmed = Counter.builder("saga_end_total")
+                .description("Total de fins de saga publicados pelo reserva-service")
+                .tag("service", "reserva-service")
+                .tag("event_type", ReservaEventTypes.RESERVA_CONFIRMADA)
+                .register(meterRegistry);
+
+        this.sagaEndCancelled = Counter.builder("saga_end_total")
+                .description("Total de fins de saga publicados pelo reserva-service")
+                .tag("service", "reserva-service")
+                .tag("event_type", ReservaEventTypes.RESERVA_CANCELADA)
+                .register(meterRegistry);
     }
 
     public void publicarReservaPendenteValidacao(Long reservaId, UUID correlationId, String destinatario) {
@@ -45,11 +88,10 @@ public class ReservaProducer {
                 payload
         );
 
-        kafkaTemplate.send(reservaEventsTopic, correlationId.toString(), env);
+        sendObserved(reservaEventsTopic, ReservaEventTypes.PENDING_VALIDATION, correlationId, env);
     }
 
     public void publicarReservaCriada(ReservaCriadaData data, UUID correlationId) {
-
         Map<String, Object> snapshotMap = null;
         if (data.snapshot() != null) {
             snapshotMap = new HashMap<>();
@@ -76,7 +118,7 @@ public class ReservaProducer {
                 payload
         );
 
-        kafkaTemplate.send(reservaEventsTopic, correlationId.toString(), env);
+        sendObserved(reservaEventsTopic, ReservaEventTypes.RESERVA_CRIADA, correlationId, env);
     }
 
     public void publicarReservaConfirmada(
@@ -112,17 +154,16 @@ public class ReservaProducer {
                 )
         );
 
-        kafkaTemplate.send(reservaEventsTopic, correlationId.toString(), env);
+        sendObserved(reservaEventsTopic, ReservaEventTypes.RESERVA_CONFIRMADA, correlationId, env);
     }
 
     public void publicarReservaCancelada(Long reservaId, UUID correlationId, String motivo, ClienteSnapshot snapshot) {
-
         Map<String, Object> snapshotMap = null;
         if (snapshot != null) {
             snapshotMap = new HashMap<>();
             snapshotMap.put("paymentToken", snapshot.paymentToken());
             snapshotMap.put("email", snapshot.email());
-            snapshotMap.put("nome", snapshot.nome());
+            snapshotMap.put("nome", snapshot.nome()); // ✅ corrigido
         }
 
         Map<String, Object> payload = new HashMap<>();
@@ -140,6 +181,60 @@ public class ReservaProducer {
                 payload
         );
 
-        kafkaTemplate.send(reservaEventsTopic, correlationId.toString(), env);
+        sendObserved(reservaEventsTopic, ReservaEventTypes.RESERVA_CANCELADA, correlationId, env);
+    }
+
+    private void sendObserved(String topic, String eventType, UUID correlationId, Object env) {
+        if (correlationId != null) {
+            MDC.put("correlationId", correlationId.toString());
+        }
+
+        Observation obs = Observation.start("saga.publish.reserva-events", observationRegistry)
+                .lowCardinalityKeyValue("messaging.system", "kafka")
+                .lowCardinalityKeyValue("messaging.operation", "send")
+                .lowCardinalityKeyValue("topic", topic)
+                .lowCardinalityKeyValue("event.type", eventType)
+                .lowCardinalityKeyValue("producer", "reserva-events")
+                .lowCardinalityKeyValue("saga.id", correlationId != null ? correlationId.toString() : "null");
+
+        try (Observation.Scope scope = obs.openScope()) {
+
+            ProducerRecord<String, Object> record =
+                    new ProducerRecord<>(topic, correlationId != null ? correlationId.toString() : null, env);
+
+            // ✅ injeta trace context (traceparent/baggage) nos headers
+            PROPAGATOR.inject(Context.current(), record.headers(), KAFKA_HEADERS_SETTER);
+
+            kafkaTemplate.send(record).whenComplete((result, ex) -> {
+                try {
+                    if (ex != null) {
+                        obs.error(ex);
+                    } else {
+                        if (result != null && result.getRecordMetadata() != null) {
+                            obs.lowCardinalityKeyValue(
+                                    "partition",
+                                    String.valueOf(result.getRecordMetadata().partition())
+                            );
+                        }
+
+                        // ✅ incrementa SOMENTE quando o publish foi OK
+                        if (ReservaEventTypes.RESERVA_CONFIRMADA.equals(eventType)) {
+                            sagaEndConfirmed.increment();
+                        } else if (ReservaEventTypes.RESERVA_CANCELADA.equals(eventType)) {
+                            sagaEndCancelled.increment();
+                        }
+                    }
+                } finally {
+                    obs.stop();
+                    MDC.remove("correlationId");
+                }
+            });
+
+        } catch (Exception ex) {
+            obs.error(ex);
+            obs.stop();
+            MDC.remove("correlationId");
+            throw ex;
+        }
     }
 }
