@@ -32,7 +32,9 @@ public class ReservaProducer {
             GlobalOpenTelemetry.getPropagators().getTextMapPropagator();
 
     private static final TextMapSetter<Headers> KAFKA_HEADERS_SETTER = (headers, key, value) -> {
-        if (headers == null || key == null || value == null) return;
+        if (headers == null || key == null || value == null) {
+            return;
+        }
         headers.remove(key);
         headers.add(key, value.getBytes(StandardCharsets.UTF_8));
     };
@@ -43,7 +45,6 @@ public class ReservaProducer {
     private final String reservaEventsTopic;
     private final String source;
 
-    // ✅ Contadores para “fim” da saga (publicação bem-sucedida)
     private final Counter sagaEndConfirmed;
     private final Counter sagaEndCancelled;
 
@@ -79,7 +80,7 @@ public class ReservaProducer {
         payload.put("destinatario", destinatario);
         payload.put("correlationId", correlationId);
 
-        var env = new EventEnvelope(
+        EventEnvelope envelope = new EventEnvelope(
                 UUID.randomUUID(),
                 ReservaEventTypes.PENDING_VALIDATION,
                 correlationId,
@@ -88,7 +89,12 @@ public class ReservaProducer {
                 payload
         );
 
-        sendObserved(reservaEventsTopic, ReservaEventTypes.PENDING_VALIDATION, correlationId, env);
+        sendObserved(
+                reservaEventsTopic,
+                ReservaEventTypes.PENDING_VALIDATION,
+                correlationId,
+                envelope
+        );
     }
 
     public void publicarReservaCriada(ReservaCriadaData data, UUID correlationId) {
@@ -109,7 +115,7 @@ public class ReservaProducer {
         payload.put("snapshot", snapshotMap);
         payload.put("correlationId", data.correlationId());
 
-        var env = new EventEnvelope(
+        EventEnvelope envelope = new EventEnvelope(
                 UUID.randomUUID(),
                 ReservaEventTypes.RESERVA_CRIADA,
                 correlationId,
@@ -118,7 +124,12 @@ public class ReservaProducer {
                 payload
         );
 
-        sendObserved(reservaEventsTopic, ReservaEventTypes.RESERVA_CRIADA, correlationId, env);
+        sendObserved(
+                reservaEventsTopic,
+                ReservaEventTypes.RESERVA_CRIADA,
+                correlationId,
+                envelope
+        );
     }
 
     public void publicarReservaConfirmada(
@@ -134,7 +145,7 @@ public class ReservaProducer {
             throw new IllegalArgumentException("snapshot.email é obrigatório para RESERVA_CONFIRMADA");
         }
 
-        var env = new EventEnvelope(
+        EventEnvelope envelope = new EventEnvelope(
                 UUID.randomUUID(),
                 ReservaEventTypes.RESERVA_CONFIRMADA,
                 correlationId,
@@ -154,16 +165,26 @@ public class ReservaProducer {
                 )
         );
 
-        sendObserved(reservaEventsTopic, ReservaEventTypes.RESERVA_CONFIRMADA, correlationId, env);
+        sendObserved(
+                reservaEventsTopic,
+                ReservaEventTypes.RESERVA_CONFIRMADA,
+                correlationId,
+                envelope
+        );
     }
 
-    public void publicarReservaCancelada(Long reservaId, UUID correlationId, String motivo, ClienteSnapshot snapshot) {
+    public void publicarReservaCancelada(
+            Long reservaId,
+            UUID correlationId,
+            String motivo,
+            ClienteSnapshot snapshot
+    ) {
         Map<String, Object> snapshotMap = null;
         if (snapshot != null) {
             snapshotMap = new HashMap<>();
             snapshotMap.put("paymentToken", snapshot.paymentToken());
             snapshotMap.put("email", snapshot.email());
-            snapshotMap.put("nome", snapshot.nome()); // ✅ corrigido
+            snapshotMap.put("nome", snapshot.nome());
         }
 
         Map<String, Object> payload = new HashMap<>();
@@ -172,7 +193,7 @@ public class ReservaProducer {
         payload.put("snapshot", snapshotMap);
         payload.put("correlationId", correlationId);
 
-        var env = new EventEnvelope(
+        EventEnvelope envelope = new EventEnvelope(
                 UUID.randomUUID(),
                 ReservaEventTypes.RESERVA_CANCELADA,
                 correlationId,
@@ -181,60 +202,69 @@ public class ReservaProducer {
                 payload
         );
 
-        sendObserved(reservaEventsTopic, ReservaEventTypes.RESERVA_CANCELADA, correlationId, env);
+        sendObserved(
+                reservaEventsTopic,
+                ReservaEventTypes.RESERVA_CANCELADA,
+                correlationId,
+                envelope
+        );
     }
 
-    private void sendObserved(String topic, String eventType, UUID correlationId, Object env) {
+    private void sendObserved(String topic, String eventType, UUID correlationId, Object payload) {
         if (correlationId != null) {
             MDC.put("correlationId", correlationId.toString());
         }
 
-        Observation obs = Observation.start("saga.publish.reserva-events", observationRegistry)
+        Observation observation = Observation.createNotStarted(
+                        "saga.publish." + eventType.toLowerCase().replace('_', '-'),
+                        observationRegistry
+                )
                 .lowCardinalityKeyValue("messaging.system", "kafka")
                 .lowCardinalityKeyValue("messaging.operation", "send")
                 .lowCardinalityKeyValue("topic", topic)
                 .lowCardinalityKeyValue("event.type", eventType)
-                .lowCardinalityKeyValue("producer", "reserva-events")
-                .lowCardinalityKeyValue("saga.id", correlationId != null ? correlationId.toString() : "null");
+                .lowCardinalityKeyValue("producer", "reserva-service")
+                .lowCardinalityKeyValue(
+                        "correlationId",
+                        correlationId != null ? correlationId.toString() : "null"
+                )
+                .highCardinalityKeyValue(
+                        "correlationId",
+                        correlationId != null ? correlationId.toString() : "null"
+                );
 
-        try (Observation.Scope scope = obs.openScope()) {
-
+        try {
             ProducerRecord<String, Object> record =
-                    new ProducerRecord<>(topic, correlationId != null ? correlationId.toString() : null, env);
+                    new ProducerRecord<>(topic, correlationId != null ? correlationId.toString() : null, payload);
 
-            // ✅ injeta trace context (traceparent/baggage) nos headers
-            PROPAGATOR.inject(Context.current(), record.headers(), KAFKA_HEADERS_SETTER);
+            observation.start();
+            try (Observation.Scope scope = observation.openScope()) {
+                PROPAGATOR.inject(Context.current(), record.headers(), KAFKA_HEADERS_SETTER);
 
-            kafkaTemplate.send(record).whenComplete((result, ex) -> {
-                try {
-                    if (ex != null) {
-                        obs.error(ex);
-                    } else {
-                        if (result != null && result.getRecordMetadata() != null) {
-                            obs.lowCardinalityKeyValue(
-                                    "partition",
-                                    String.valueOf(result.getRecordMetadata().partition())
-                            );
-                        }
-
-                        // ✅ incrementa SOMENTE quando o publish foi OK
-                        if (ReservaEventTypes.RESERVA_CONFIRMADA.equals(eventType)) {
-                            sagaEndConfirmed.increment();
-                        } else if (ReservaEventTypes.RESERVA_CANCELADA.equals(eventType)) {
-                            sagaEndCancelled.increment();
-                        }
-                    }
-                } finally {
-                    obs.stop();
-                    MDC.remove("correlationId");
-                }
-            });
+                kafkaTemplate.send(record)
+                        .whenComplete((result, ex) -> {
+                            try {
+                                if (ex != null) {
+                                    observation.error(ex);
+                                } else {
+                                    if (ReservaEventTypes.RESERVA_CONFIRMADA.equals(eventType)) {
+                                        sagaEndConfirmed.increment();
+                                    } else if (ReservaEventTypes.RESERVA_CANCELADA.equals(eventType)) {
+                                        sagaEndCancelled.increment();
+                                    }
+                                }
+                            } finally {
+                                observation.stop();
+                            }
+                        });
+            }
 
         } catch (Exception ex) {
-            obs.error(ex);
-            obs.stop();
-            MDC.remove("correlationId");
+            observation.error(ex);
+            observation.stop();
             throw ex;
+        } finally {
+            MDC.remove("correlationId");
         }
     }
 }

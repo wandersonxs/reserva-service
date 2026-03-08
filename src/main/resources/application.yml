@@ -45,7 +45,7 @@ app:
       reserva-events: reserva.events
       aereo-events: aereo.events
       pagamento-events: pagamento.events
-      cliente-validation: cliente.validation
+      cliente-validation: cliente.validacao
 
 springdoc:
   api-docs:
@@ -57,7 +57,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
 
   endpoint:
     health:

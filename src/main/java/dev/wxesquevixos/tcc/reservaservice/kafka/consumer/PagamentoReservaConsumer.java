@@ -43,18 +43,26 @@ public class PagamentoReservaConsumer {
     private static final TextMapGetter<Headers> KAFKA_HEADERS_GETTER = new TextMapGetter<>() {
         @Override
         public Iterable<String> keys(Headers headers) {
-            if (headers == null) return List.of();
+            if (headers == null) {
+                return List.of();
+            }
             List<String> keys = new ArrayList<>();
-            for (Header h : headers) keys.add(h.key());
+            for (Header header : headers) {
+                keys.add(header.key());
+            }
             return keys;
         }
 
         @Override
         public String get(Headers headers, String key) {
-            if (headers == null || key == null) return null;
-            Header h = headers.lastHeader(key);
-            if (h == null || h.value() == null) return null;
-            return new String(h.value(), StandardCharsets.UTF_8);
+            if (headers == null || key == null) {
+                return null;
+            }
+            Header header = headers.lastHeader(key);
+            if (header == null || header.value() == null) {
+                return null;
+            }
+            return new String(header.value(), StandardCharsets.UTF_8);
         }
     };
 
@@ -81,180 +89,309 @@ public class PagamentoReservaConsumer {
     )
     public void consume(ConsumerRecord<String, Object> record, Acknowledgment ack) {
 
-        Observation obs = null;
+        Observation invalidObservation = null;
 
         try {
-            final EventEnvelope env = objectMapper.convertValue(record.value(), EventEnvelope.class);
-            final UUID correlationId = env.correlationId(); // seu saga.id
+            EventEnvelope envelope = objectMapper.convertValue(record.value(), EventEnvelope.class);
+            UUID correlationId = envelope.correlationId();
 
             if (correlationId != null) {
                 MDC.put("correlationId", correlationId.toString());
             }
 
-            // ✅ extrai traceparent/baggage dos headers do Kafka
-            Context extractedParent = PROPAGATOR.extract(Context.current(), record.headers(), KAFKA_HEADERS_GETTER);
+            Context extractedParent =
+                    PROPAGATOR.extract(Context.current(), record.headers(), KAFKA_HEADERS_GETTER);
 
-            // ✅ cria o span/observation como filho do contexto extraído
-            try (Scope scope = extractedParent.makeCurrent()) {
+            try (Scope ignored = extractedParent.makeCurrent()) {
 
-                obs = Observation.start("saga.step.pagamento->reserva", observationRegistry)
-                        .lowCardinalityKeyValue("service", "reserva-service")
-                        .lowCardinalityKeyValue("saga", "reserva")
-                        .lowCardinalityKeyValue("step", "pagamento")
-                        .lowCardinalityKeyValue("saga.id", correlationId != null ? correlationId.toString() : "null")
-                        .lowCardinalityKeyValue("event.type", String.valueOf(env.type()))
-                        .lowCardinalityKeyValue("topic", record.topic())
+                if ("PAGAMENTO_AUTORIZADO".equals(envelope.type())
+                        || "PAGAMENTO_CAPTURADO".equals(envelope.type())) {
+                    processarPagamentoConfirmado(record, ack, envelope, correlationId, extractedParent);
+                    return;
+                }
+
+                if ("PAGAMENTO_RECUSADO".equals(envelope.type())
+                        || "PAGAMENTO_FALHOU".equals(envelope.type())) {
+                    processarPagamentoFalhouOuRecusado(record, ack, envelope, correlationId, extractedParent);
+                    return;
+                }
+
+                Observation ignoredObservation = Observation.createNotStarted(
+                                "saga.consume.evento-ignorado",
+                                observationRegistry
+                        )
                         .lowCardinalityKeyValue("messaging.system", "kafka")
-                        .lowCardinalityKeyValue("messaging.operation", "process");
+                        .lowCardinalityKeyValue("messaging.operation", "process")
+                        .lowCardinalityKeyValue("topic", record.topic())
+                        .lowCardinalityKeyValue("event.type", String.valueOf(envelope.type()))
+                        .lowCardinalityKeyValue("consumer", "reserva-service")
+                        .lowCardinalityKeyValue(
+                                "correlationId",
+                                correlationId != null ? correlationId.toString() : "null"
+                        )
+                        .highCardinalityKeyValue(
+                                "correlationId",
+                                correlationId != null ? correlationId.toString() : "null"
+                        );
 
-                final Observation finalObs = obs;
-
-                Mono<Void> pipeline = switch (env.type()) {
-
-                    case "PAGAMENTO_AUTORIZADO", "PAGAMENTO_CAPTURADO" ->
-                            repository.findByCorrelationId(correlationId)
-                                    .switchIfEmpty(Mono.error(new IllegalStateException(
-                                            "Reserva não encontrada para correlationId=" + correlationId)))
-                                    .flatMap(reserva -> {
-
-                                        final ReservaEntity updated = new ReservaEntity(
-                                                reserva.id(),
-                                                reserva.clienteId(),
-                                                reserva.vooId(),
-                                                ReservaStatus.CONFIRMED,
-                                                reserva.valorTotal(),
-                                                reserva.moeda(),
-                                                reserva.metodo(),
-                                                reserva.motivoCancelamento(),
-                                                reserva.correlationId(),
-                                                reserva.criadoEm(),
-                                                OffsetDateTime.now(),
-                                                reserva.clientePaymentToken(),
-                                                reserva.clienteEmail(),
-                                                reserva.clienteNome()
-                                        );
-
-                                        final ClienteSnapshot snapshot = new ClienteSnapshot(
-                                                updated.clientePaymentToken(),
-                                                updated.clienteEmail(),
-                                                updated.clienteNome()
-                                        );
-
-                                        return repository.save(updated)
-                                                .doOnNext(saved ->
-                                                        producer.publicarReservaConfirmada(
-                                                                saved.id(),
-                                                                saved.vooId(),
-                                                                saved.valorTotal(),
-                                                                saved.moeda(),
-                                                                saved.metodo(),
-                                                                saved.correlationId(),
-                                                                snapshot
-                                                        )
-                                                )
-                                                .then();
-                                    });
-
-                    case "PAGAMENTO_RECUSADO", "PAGAMENTO_FALHOU" ->
-                            repository.findByCorrelationId(correlationId)
-                                    .switchIfEmpty(Mono.error(new IllegalStateException(
-                                            "Reserva não encontrada para correlationId=" + correlationId)))
-                                    .flatMap(reserva -> {
-
-                                        final String motivo = extractMotivo(env);
-
-                                        final ReservaEntity updated = new ReservaEntity(
-                                                reserva.id(),
-                                                reserva.clienteId(),
-                                                reserva.vooId(),
-                                                ReservaStatus.CANCELLED,
-                                                reserva.valorTotal(),
-                                                reserva.moeda(),
-                                                reserva.metodo(),
-                                                motivo,
-                                                reserva.correlationId(),
-                                                reserva.criadoEm(),
-                                                OffsetDateTime.now(),
-                                                reserva.clientePaymentToken(),
-                                                reserva.clienteEmail(),
-                                                reserva.clienteNome()
-                                        );
-
-                                        final ClienteSnapshot snapshot = new ClienteSnapshot(
-                                                updated.clientePaymentToken(),
-                                                updated.clienteEmail(),
-                                                updated.clienteNome()
-                                        );
-
-                                        return repository.save(updated)
-                                                .doOnNext(saved ->
-                                                        producer.publicarReservaCancelada(
-                                                                saved.id(),
-                                                                saved.correlationId(),
-                                                                motivo,
-                                                                snapshot
-                                                        )
-                                                )
-                                                .then();
-                                    });
-
-                    default -> Mono.empty();
-                };
-
-                pipeline
-                        .doOnSuccess(v -> ack.acknowledge())
-                        .doOnError(ex -> {
-                            if (finalObs != null) finalObs.error(ex);
-
-                            log.error("Erro processando pagamento.events. topic={} partition={} offset={} key={} correlationId={} msg={}",
-                                    record.topic(), record.partition(), record.offset(), record.key(),
-                                    correlationId, ex.getMessage(), ex);
-
-                            ack.acknowledge(); // TCC: descarta
-                        })
-                        .doFinally(sig -> {
-                            try {
-                                if (finalObs != null) finalObs.stop();
-                            } finally {
-                                MDC.remove("correlationId");
-                            }
-                        })
-                        .subscribe();
+                ignoredObservation.start();
+                try {
+                    log.info(
+                            "Ignorando evento em pagamento.events: type={} correlationId={}",
+                            envelope.type(),
+                            correlationId
+                    );
+                    ack.acknowledge();
+                } finally {
+                    ignoredObservation.stop();
+                }
             }
 
         } catch (Exception ex) {
+            Context extractedParent =
+                    PROPAGATOR.extract(Context.current(), record.headers(), KAFKA_HEADERS_GETTER);
 
-            // ✅ mesmo se der erro de parse, ainda dá pra tentar extrair o contexto do header
-            Context extractedParent = PROPAGATOR.extract(Context.current(), record.headers(), KAFKA_HEADERS_GETTER);
-
-            try (Scope scope = extractedParent.makeCurrent()) {
-                Observation invalidObs = Observation.start("kafka.message.invalid", observationRegistry)
+            try (Scope ignored = extractedParent.makeCurrent()) {
+                invalidObservation = Observation.createNotStarted(
+                                "kafka.message.invalid",
+                                observationRegistry
+                        )
                         .lowCardinalityKeyValue("service", "reserva-service")
                         .lowCardinalityKeyValue("topic", record.topic())
                         .lowCardinalityKeyValue("messaging.system", "kafka")
                         .lowCardinalityKeyValue("messaging.operation", "process");
 
-                invalidObs.error(ex);
+                invalidObservation.start();
+                invalidObservation.error(ex);
 
-                log.warn("Mensagem inválida em pagamento.events, descartando. topic={} partition={} offset={} key={} msg={}",
-                        record.topic(), record.partition(), record.offset(), record.key(),
-                        ex.getMessage(), ex);
+                log.warn(
+                        "Mensagem inválida em pagamento.events, descartando. topic={} partition={} offset={} key={} msg={}",
+                        record.topic(),
+                        record.partition(),
+                        record.offset(),
+                        record.key(),
+                        ex.getMessage(),
+                        ex
+                );
 
                 ack.acknowledge();
-                invalidObs.stop();
+
             } finally {
+                if (invalidObservation != null) {
+                    invalidObservation.stop();
+                }
                 MDC.remove("correlationId");
             }
         }
     }
 
-    private static String extractMotivo(EventEnvelope env) {
+    private void processarPagamentoConfirmado(
+            ConsumerRecord<String, Object> record,
+            Acknowledgment ack,
+            EventEnvelope envelope,
+            UUID correlationId,
+            Context extractedParent
+    ) {
+        Observation observation = Observation.createNotStarted(
+                        "saga.consume.pagamento-confirmado",
+                        observationRegistry
+                )
+                .lowCardinalityKeyValue("messaging.system", "kafka")
+                .lowCardinalityKeyValue("messaging.operation", "process")
+                .lowCardinalityKeyValue("topic", record.topic())
+                .lowCardinalityKeyValue("event.type", String.valueOf(envelope.type()))
+                .lowCardinalityKeyValue("consumer", "reserva-service")
+                .lowCardinalityKeyValue(
+                        "correlationId",
+                        correlationId != null ? correlationId.toString() : "null"
+                )
+                .highCardinalityKeyValue(
+                        "correlationId",
+                        correlationId != null ? correlationId.toString() : "null"
+                );
+
+        Mono<Void> pipeline = Mono.defer(() -> {
+                    observation.start();
+
+                    return repository.findByCorrelationId(correlationId)
+                            .switchIfEmpty(Mono.error(new IllegalStateException(
+                                    "Reserva não encontrada para correlationId=" + correlationId)))
+                            .flatMap(reserva -> {
+                                ReservaEntity updated = new ReservaEntity(
+                                        reserva.id(),
+                                        reserva.clienteId(),
+                                        reserva.vooId(),
+                                        ReservaStatus.CONFIRMED,
+                                        reserva.valorTotal(),
+                                        reserva.moeda(),
+                                        reserva.metodo(),
+                                        reserva.motivoCancelamento(),
+                                        reserva.correlationId(),
+                                        reserva.criadoEm(),
+                                        OffsetDateTime.now(),
+                                        reserva.clientePaymentToken(),
+                                        reserva.clienteEmail(),
+                                        reserva.clienteNome()
+                                );
+
+                                ClienteSnapshot snapshot = new ClienteSnapshot(
+                                        updated.clientePaymentToken(),
+                                        updated.clienteEmail(),
+                                        updated.clienteNome()
+                                );
+
+                                return repository.save(updated)
+                                        .doOnNext(saved -> {
+                                            try (Scope producerScope = extractedParent.makeCurrent()) {
+                                                producer.publicarReservaConfirmada(
+                                                        saved.id(),
+                                                        saved.vooId(),
+                                                        saved.valorTotal(),
+                                                        saved.moeda(),
+                                                        saved.metodo(),
+                                                        saved.correlationId(),
+                                                        snapshot
+                                                );
+                                            }
+                                        })
+                                        .then();
+                            });
+                })
+                .doOnSuccess(ignoredSignal -> ack.acknowledge())
+                .doOnError(ex -> {
+                    observation.error(ex);
+
+                    log.error(
+                            "Erro processando pagamento confirmado. topic={} partition={} offset={} key={} correlationId={} msg={}",
+                            record.topic(),
+                            record.partition(),
+                            record.offset(),
+                            record.key(),
+                            correlationId,
+                            ex.getMessage(),
+                            ex
+                    );
+
+                    ack.acknowledge();
+                })
+                .doFinally(signalType -> {
+                    try {
+                        observation.stop();
+                    } finally {
+                        MDC.remove("correlationId");
+                    }
+                });
+
+        pipeline.subscribe();
+    }
+
+    private void processarPagamentoFalhouOuRecusado(
+            ConsumerRecord<String, Object> record,
+            Acknowledgment ack,
+            EventEnvelope envelope,
+            UUID correlationId,
+            Context extractedParent
+    ) {
+        Observation observation = Observation.createNotStarted(
+                        "saga.consume.pagamento-falhou-ou-recusado",
+                        observationRegistry
+                )
+                .lowCardinalityKeyValue("messaging.system", "kafka")
+                .lowCardinalityKeyValue("messaging.operation", "process")
+                .lowCardinalityKeyValue("topic", record.topic())
+                .lowCardinalityKeyValue("event.type", String.valueOf(envelope.type()))
+                .lowCardinalityKeyValue("consumer", "reserva-service")
+                .lowCardinalityKeyValue(
+                        "correlationId",
+                        correlationId != null ? correlationId.toString() : "null"
+                )
+                .highCardinalityKeyValue(
+                        "correlationId",
+                        correlationId != null ? correlationId.toString() : "null"
+                );
+
+        Mono<Void> pipeline = Mono.defer(() -> {
+                    observation.start();
+
+                    return repository.findByCorrelationId(correlationId)
+                            .switchIfEmpty(Mono.error(new IllegalStateException(
+                                    "Reserva não encontrada para correlationId=" + correlationId)))
+                            .flatMap(reserva -> {
+                                String motivo = extractMotivo(envelope);
+
+                                ReservaEntity updated = new ReservaEntity(
+                                        reserva.id(),
+                                        reserva.clienteId(),
+                                        reserva.vooId(),
+                                        ReservaStatus.CANCELLED,
+                                        reserva.valorTotal(),
+                                        reserva.moeda(),
+                                        reserva.metodo(),
+                                        motivo,
+                                        reserva.correlationId(),
+                                        reserva.criadoEm(),
+                                        OffsetDateTime.now(),
+                                        reserva.clientePaymentToken(),
+                                        reserva.clienteEmail(),
+                                        reserva.clienteNome()
+                                );
+
+                                ClienteSnapshot snapshot = new ClienteSnapshot(
+                                        updated.clientePaymentToken(),
+                                        updated.clienteEmail(),
+                                        updated.clienteNome()
+                                );
+
+                                return repository.save(updated)
+                                        .doOnNext(saved -> {
+                                            try (Scope producerScope = extractedParent.makeCurrent()) {
+                                                producer.publicarReservaCancelada(
+                                                        saved.id(),
+                                                        saved.correlationId(),
+                                                        motivo,
+                                                        snapshot
+                                                );
+                                            }
+                                        })
+                                        .then();
+                            });
+                })
+                .doOnSuccess(ignoredSignal -> ack.acknowledge())
+                .doOnError(ex -> {
+                    observation.error(ex);
+
+                    log.error(
+                            "Erro processando pagamento recusado/falhou. topic={} partition={} offset={} key={} correlationId={} msg={}",
+                            record.topic(),
+                            record.partition(),
+                            record.offset(),
+                            record.key(),
+                            correlationId,
+                            ex.getMessage(),
+                            ex
+                    );
+
+                    ack.acknowledge();
+                })
+                .doFinally(signalType -> {
+                    try {
+                        observation.stop();
+                    } finally {
+                        MDC.remove("correlationId");
+                    }
+                });
+
+        pipeline.subscribe();
+    }
+
+    private static String extractMotivo(EventEnvelope envelope) {
         try {
-            if (env.data() instanceof Map<?, ?> map) {
-                Object v = map.get("motivo");
-                return v != null ? v.toString() : "Pagamento recusado/falhou";
+            if (envelope.data() instanceof Map<?, ?> map) {
+                Object motivo = map.get("motivo");
+                return motivo != null ? motivo.toString() : "Pagamento recusado/falhou";
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return "Pagamento recusado/falhou";
     }
 }

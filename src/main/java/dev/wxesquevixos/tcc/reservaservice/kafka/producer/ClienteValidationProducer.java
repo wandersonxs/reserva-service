@@ -23,11 +23,12 @@ import java.util.UUID;
 @Component
 public class ClienteValidationProducer {
 
-    private static final TextMapPropagator PROPAGATOR =
-            GlobalOpenTelemetry.getPropagators().getTextMapPropagator();
+    private static final TextMapPropagator PROPAGATOR =  GlobalOpenTelemetry.getPropagators().getTextMapPropagator();
 
     private static final TextMapSetter<Headers> KAFKA_HEADERS_SETTER = (headers, key, value) -> {
-        if (headers == null || key == null || value == null) return;
+        if (headers == null || key == null || value == null) {
+            return;
+        }
         headers.remove(key);
         headers.add(key, value.getBytes(StandardCharsets.UTF_8));
     };
@@ -50,22 +51,20 @@ public class ClienteValidationProducer {
     }
 
     public void publicarValidarCliente(Long reservaId, Long clienteId, UUID correlationId) {
-
         MDC.put("correlationId", correlationId.toString());
 
-        Observation obs = Observation.start("saga.publish.cliente-validation", observationRegistry)
+        Observation observation = Observation.createNotStarted("saga.publish.validar-cliente", observationRegistry)
                 .lowCardinalityKeyValue("messaging.system", "kafka")
                 .lowCardinalityKeyValue("messaging.operation", "send")
                 .lowCardinalityKeyValue("topic", topic)
-                .lowCardinalityKeyValue("event.type", ClienteValidationEventTypes.VALIDAR_CLIENTE)
-                .lowCardinalityKeyValue("producer", "cliente.validation")
-                .lowCardinalityKeyValue("saga.id", correlationId.toString());
+                .lowCardinalityKeyValue("event.type", ClienteValidationEventTypes.VALIDAR_CLIENTE.name())
+                .lowCardinalityKeyValue("producer", "reserva-service")
+                .highCardinalityKeyValue("correlationId", correlationId.toString());
 
-        try (Observation.Scope scope = obs.openScope()) {
-
-            var env = new EventEnvelope(
+        try {
+            EventEnvelope eventEnvelope = new EventEnvelope(
                     UUID.randomUUID(),
-                    ClienteValidationEventTypes.VALIDAR_CLIENTE,
+                    ClienteValidationEventTypes.VALIDAR_CLIENTE.name(),
                     correlationId,
                     OffsetDateTime.now(),
                     source,
@@ -77,25 +76,28 @@ public class ClienteValidationProducer {
             );
 
             ProducerRecord<String, Object> record =
-                    new ProducerRecord<>(topic, correlationId.toString(), env);
+                    new ProducerRecord<>(topic, correlationId.toString(), eventEnvelope);
 
-            // ✅ injeta trace context nos headers Kafka
-            PROPAGATOR.inject(Context.current(), record.headers(), KAFKA_HEADERS_SETTER);
+            observation.start();
+            try (Observation.Scope scope = observation.openScope()) {
+                PROPAGATOR.inject(Context.current(), record.headers(), KAFKA_HEADERS_SETTER);
 
-            kafkaTemplate.send(record).whenComplete((result, ex) -> {
-                try {
-                    if (ex != null) obs.error(ex);
-                } finally {
-                    obs.stop();
-                    MDC.remove("correlationId");
-                }
-            });
-
+                kafkaTemplate.send(record).whenComplete((result, ex) -> {
+                    try {
+                        if (ex != null) {
+                            observation.error(ex);
+                        }
+                    } finally {
+                        observation.stop();
+                    }
+                });
+            }
         } catch (Exception ex) {
-            obs.error(ex);
-            obs.stop();
-            MDC.remove("correlationId");
+            observation.error(ex);
+            observation.stop();
             throw ex;
+        } finally {
+            MDC.remove("correlationId");
         }
     }
 }

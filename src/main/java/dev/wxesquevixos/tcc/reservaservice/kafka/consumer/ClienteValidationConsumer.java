@@ -39,18 +39,29 @@ public class ClienteValidationConsumer {
     private static final TextMapGetter<Headers> KAFKA_HEADERS_GETTER = new TextMapGetter<>() {
         @Override
         public Iterable<String> keys(Headers headers) {
-            if (headers == null) return List.of();
+            if (headers == null) {
+                return List.of();
+            }
+
             List<String> keys = new ArrayList<>();
-            for (Header h : headers) keys.add(h.key());
+            for (Header header : headers) {
+                keys.add(header.key());
+            }
             return keys;
         }
 
         @Override
         public String get(Headers headers, String key) {
-            if (headers == null || key == null) return null;
-            Header h = headers.lastHeader(key);
-            if (h == null || h.value() == null) return null;
-            return new String(h.value(), StandardCharsets.UTF_8);
+            if (headers == null || key == null) {
+                return null;
+            }
+
+            Header header = headers.lastHeader(key);
+            if (header == null || header.value() == null) {
+                return null;
+            }
+
+            return new String(header.value(), StandardCharsets.UTF_8);
         }
     };
 
@@ -73,57 +84,70 @@ public class ClienteValidationConsumer {
             groupId = "${app.kafka.consumer.group-id}"
     )
     public void consume(ConsumerRecord<String, Object> record, Acknowledgment ack) {
-
-        Observation obs = null;
+        Observation observation = null;
 
         try {
-            final EventEnvelope env = objectMapper.convertValue(record.value(), EventEnvelope.class);
-            final UUID correlationId = env.correlationId();
+            EventEnvelope envelope = objectMapper.convertValue(record.value(), EventEnvelope.class);
+            UUID correlationId = envelope.correlationId();
 
             if (correlationId != null) {
                 MDC.put("correlationId", correlationId.toString());
             }
 
-            if (!ClienteValidationEventTypes.CLIENTE_VALIDADO.equals(env.type())) {
-                log.info("Ignorando evento em cliente.validation: type={} correlationId={}", env.type(), correlationId);
+            if (!envelope.type().equalsIgnoreCase(ClienteValidationEventTypes.CLIENTE_VALIDADO.name())) {
+                log.info("Ignorando evento em cliente.validation: type={} correlationId={}",
+                        envelope.type(), correlationId);
                 ack.acknowledge();
                 return;
             }
 
-            final ClienteValidadoData data = objectMapper.convertValue(env.data(), ClienteValidadoData.class);
+            ClienteValidadoData data =
+                    objectMapper.convertValue(envelope.data(), ClienteValidadoData.class);
 
-            // ✅ Extrai o contexto do trace dos headers do Kafka (traceparent/baggage)
-            Context extractedParent = PROPAGATOR.extract(Context.current(), record.headers(), KAFKA_HEADERS_GETTER);
+            Context extractedParent =
+                    PROPAGATOR.extract(Context.current(), record.headers(), KAFKA_HEADERS_GETTER);
 
-            // ✅ Tudo que iniciar aqui dentro herda o traceId do producer
-            try (Scope otelScope = extractedParent.makeCurrent()) {
-
-                obs = Observation.start("saga.step.cliente-validation", observationRegistry)
-                        .lowCardinalityKeyValue("saga.id", correlationId != null ? correlationId.toString() : "null")
-                        .lowCardinalityKeyValue("event.type", String.valueOf(env.type()))
-                        .lowCardinalityKeyValue("topic", record.topic())
-                        .lowCardinalityKeyValue("consumer", "cliente.validation")
+            try (Scope ignored = extractedParent.makeCurrent()) {
+                observation = Observation.createNotStarted(
+                                "saga.consume.cliente-validado",
+                                observationRegistry
+                        )
                         .lowCardinalityKeyValue("messaging.system", "kafka")
-                        .lowCardinalityKeyValue("messaging.operation", "process");
+                        .lowCardinalityKeyValue("messaging.operation", "process")
+                        .lowCardinalityKeyValue("topic", record.topic())
+                        .lowCardinalityKeyValue("event.type", ClienteValidationEventTypes.CLIENTE_VALIDADO.name())
+                        .lowCardinalityKeyValue("consumer", "reserva-service")
+                        .highCardinalityKeyValue(
+                                "correlationId",
+                                correlationId != null ? correlationId.toString() : "null"
+                        );
 
-                final Observation finalObs = obs;
+                Observation finalObservation = observation;
+                finalObservation.start();
 
-                Mono<Void> pipeline = reservaService.onClienteValidado(env, data);
+                Mono<Void> pipeline = reservaService.onClienteValidado(envelope, data);
 
                 pipeline
-                        .doOnSuccess(v -> ack.acknowledge())
+                        .doOnSuccess(ignoredSignal -> ack.acknowledge())
                         .doOnError(ex -> {
-                            if (finalObs != null) finalObs.error(ex);
+                            finalObservation.error(ex);
 
-                            log.error("Erro processando CLIENTE_VALIDADO. topic={} partition={} offset={} key={} correlationId={} msg={}",
-                                    record.topic(), record.partition(), record.offset(), record.key(),
-                                    correlationId, ex.getMessage(), ex);
+                            log.error(
+                                    "Erro processando CLIENTE_VALIDADO. topic={} partition={} offset={} key={} correlationId={} msg={}",
+                                    record.topic(),
+                                    record.partition(),
+                                    record.offset(),
+                                    record.key(),
+                                    correlationId,
+                                    ex.getMessage(),
+                                    ex
+                            );
 
                             ack.acknowledge(); // TCC: descarta
                         })
-                        .doFinally(signal -> {
+                        .doFinally(signalType -> {
                             try {
-                                if (finalObs != null) finalObs.stop();
+                                finalObservation.stop();
                             } finally {
                                 MDC.remove("correlationId");
                             }
@@ -132,14 +156,22 @@ public class ClienteValidationConsumer {
             }
 
         } catch (Exception ex) {
-            if (obs != null) obs.error(ex);
+            if (observation != null) {
+                observation.error(ex);
+                observation.stop();
+            }
 
-            log.error("Erro no consumer cliente.validation (parse/process). topic={} partition={} offset={} key={} msg={}",
-                    record.topic(), record.partition(), record.offset(), record.key(), ex.getMessage(), ex);
+            log.error(
+                    "Erro no consumer cliente.validation (parse/process). topic={} partition={} offset={} key={} msg={}",
+                    record.topic(),
+                    record.partition(),
+                    record.offset(),
+                    record.key(),
+                    ex.getMessage(),
+                    ex
+            );
 
             ack.acknowledge();
-
-            if (obs != null) obs.stop();
             MDC.remove("correlationId");
         }
     }
