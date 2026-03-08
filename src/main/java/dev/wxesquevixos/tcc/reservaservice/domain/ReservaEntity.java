@@ -17,6 +17,9 @@ public record ReservaEntity(
         @Column("cliente_id")
         Long clienteId,
 
+        @Column("voo_id")
+        Long vooId,
+
         @Column("status")
         ReservaStatus status,
 
@@ -26,6 +29,12 @@ public record ReservaEntity(
         @Column("moeda")
         String moeda,
 
+        @Column("metodo")
+        String metodo,
+
+        @Column("motivo_cancelamento")
+        String motivoCancelamento,
+
         @Column("correlation_id")
         UUID correlationId,
 
@@ -33,6 +42,15 @@ public record ReservaEntity(
         OffsetDateTime criadoEm,
 
         @Column("atualizado_em")
-        OffsetDateTime atualizadoEm
-) {
-}
+        OffsetDateTime atualizadoEm,
+
+        // ✅ snapshot persistido
+        @Column("cliente_payment_token")
+        String clientePaymentToken,
+
+        @Column("cliente_email")
+        String clienteEmail,
+
+        @Column("cliente_nome")
+        String clienteNome
+) {}

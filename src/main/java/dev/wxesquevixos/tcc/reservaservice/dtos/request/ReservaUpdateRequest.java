@@ -8,5 +8,6 @@ public record ReservaUpdateRequest(
         Long clienteId,
         ReservaStatus status,
         BigDecimal valorTotal,
-        String moeda
+        String moeda,
+        String motivoCancelamento
 ) {}

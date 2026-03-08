@@ -1,5 +1,6 @@
 package dev.wxesquevixos.tcc.reservaservice.api.handler;
 
+import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaAereaSolicitarRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaCreateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.request.ReservaUpdateRequest;
 import dev.wxesquevixos.tcc.reservaservice.dtos.response.ReservaResponse;
@@ -35,6 +36,23 @@ public class ReservaHandler {
                 .flatMap(service::create)
                 .map(ReservaMapper::toResponse)
                 .flatMap(resp -> status(201)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(resp))
+                .onErrorResume(this::mapError);
+    }
+
+    /**
+     * ✅ Endpoint de entrada do fluxo (BFF chama e o reserva-service inicia a SAGA):
+     * - cria reserva PENDING (idempotente por correlationId)
+     * - publica RESERVA_CRIADA em reserva.events (dentro do service)
+     */
+    public Mono<ServerResponse> solicitarCompraAerea(ServerRequest request) {
+        return request.bodyToMono(ReservaAereaSolicitarRequest.class)
+                .flatMap(this::validate)
+                .flatMap(service::solicitarCompraAerea)
+                .map(ReservaMapper::toResponse)
+                // Como você quer iniciar o fluxo, faz sentido responder 202 (Accepted)
+                .flatMap(resp -> status(202)
                         .contentType(MediaType.APPLICATION_JSON)
                         .bodyValue(resp))
                 .onErrorResume(this::mapError);
